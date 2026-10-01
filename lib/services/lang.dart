@@ -14,7 +14,7 @@ final Map<String, Map<String, String>> lang = {
     'set_visual': 'ESTILO: ',
     'set_focus': 'FOCO: ',
     'set_clear': 'LIMPAR DADOS',
-    'set_donate': 'COMPRA-ME UM CAFÉ',
+    'set_github': 'VISITAR GITHUB',
     'vol': 'VOL',
   },
   'en': {
@@ -32,7 +32,7 @@ final Map<String, Map<String, String>> lang = {
     'set_visual': 'STYLE: ',
     'set_focus': 'FOCUS: ',
     'set_clear': 'CLEAR DATA',
-    'set_donate': 'BUY ME A COFFEE',
+    'set_github': 'VISIT GITHUB',
     'vol': 'VOL',
   },
 };

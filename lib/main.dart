@@ -2889,7 +2889,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       "${lang[currentLang]!['set_visual']}${visualStyle.toUpperCase()}",
       "${lang[currentLang]!['set_focus']}${_focusModeDuration == 0 ? 'OFF' : '$_focusModeDuration MIN'}",
       lang[currentLang]!['set_clear']!,
-      lang[currentLang]!['set_donate']!,
+      lang[currentLang]!['set_github']!,
     ];
 
     return Container(
@@ -2972,7 +2972,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
           });
           _saveData();
         } else if (index == 5) {
-          final Uri url = Uri.parse('https://buymeacoffee.com/alexis6859');
+          final Uri url = Uri.parse('https://github.com/alexis6859/bitplayer');
           launchUrl(url, mode: LaunchMode.externalApplication);
         }
       },

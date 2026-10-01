@@ -34,7 +34,7 @@ dependencies:
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
+  cupertino_icons: ^2.0.0
   text_scroll: ^0.2.1
   file_picker: ^13.1.0
   path: ^1.9.1
@@ -48,6 +48,7 @@ dependencies:
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  flutter_launcher_icons: ^0.14.4
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
@@ -61,10 +62,6 @@ dev_dependencies:
 
 # The following section is specific to Flutter packages.
 flutter:
-
-  # The following line ensures that the Material Icons font is
-  # included with your application, so that you can use the icons in
-  # the material Icons class.
   fonts:
     - family: RetroFont
       fonts:
@@ -73,6 +70,15 @@ flutter:
   assets:
     - assets/Icons/
     - assets/Idle.mp4
+
+# Remove o bloco flutter_icons de dentro do flutter e coloca-o encostado à margem esquerda!
+flutter_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon.png"
+  # Se quiseres podes também definir uma cor de fundo para ícones adaptáveis no Android:
+  # adaptive_icon_background: "#1E292B" 
+  # adaptive_icon_foreground: "assets/icon.png"
 
   # To add assets to your application, add an assets section, like this:
   # assets:
