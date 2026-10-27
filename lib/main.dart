@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:text_scroll/text_scroll.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
@@ -15,7 +16,9 @@ import 'widgets/interactive_button.dart';
 import 'models/retro_themes.dart';
 import 'games/games_main.dart';
 import 'services/lang.dart';
+import 'services/audio_utils.dart';
 import 'painters/custom_paints.dart';
+import 'widgets/visualizer.dart';
 
 late final MyAudioHandler audioHandler;
 
@@ -23,14 +26,21 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
 
-  audioHandler = await AudioService.init(
-    builder: () => MyAudioHandler(Player()),
-    config: const AudioServiceConfig(
-      androidNotificationChannelId: 'com.bitplayer.audio.channel',
-      androidNotificationChannelName: 'BitPlayer Media Controls',
-      androidNotificationOngoing: true,
-    ),
-  );
+  try {
+    audioHandler = await AudioService.init(
+      builder: () => MyAudioHandler(Player()),
+      config: const AudioServiceConfig(
+        androidNotificationChannelId: 'com.bitplayer.audio.channel',
+        androidNotificationChannelName: 'BitPlayer Media Controls',
+        androidNotificationOngoing: true,
+      ),
+    );
+  } catch (e) {
+    // Plataformas sem implementação do audio_service (ex.: Linux/Windows)
+    // continuam a funcionar, apenas sem controlos de media do sistema.
+    debugPrint("audio_service indisponível: $e");
+    audioHandler = MyAudioHandler(Player());
+  }
 
   runApp(const MyApp());
 }
@@ -113,9 +123,10 @@ class RetroDeviceScreen extends StatefulWidget {
 }
 
 class _RetroDeviceScreenState extends State<RetroDeviceScreen>
-    with TickerProviderStateMixin {
+    with WidgetsBindingObserver {
   late final Player player;
-  late AnimationController _spectrumController;
+  final List<StreamSubscription> _subscriptions = [];
+  final FocusNode _keyboardFocus = FocusNode();
 
   String currentLang = 'pt';
   String currentView = 'player';
@@ -130,13 +141,16 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
   bool isDraggingLetter = false;
   String currentLetter = '';
 
-  Duration position = Duration.zero;
   Duration duration = Duration.zero;
 
   List<String> libraryPaths = [];
   List<String> queuePaths = [];
   int currentIndex = 0;
-  String currentTrackName = "NENHUMA FAIXA";
+  // Enquanto a fila é reordenada no mpv, ignoramos os eventos intermédios.
+  bool _isReorderingPlaylist = false;
+  String currentTrackName = "";
+  String? _flashMessage;
+  Timer? _flashTimer;
   int currentTrackBpm = 120;
 
   double currentVolume = 100.0;
@@ -147,19 +161,20 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
   int selectedLibraryItem = 0;
   int selectedGameItem = 0;
   int selectedEqPreset = 0;
+  double eqStrength = 1.0;
+  // Passa a false se a build do mpv não suportar os filtros de análise.
+  bool _audioAnalysisAvailable = true;
+  bool _audioAnalysisVerified = false;
+  // Se a medição está ligada no mpv neste momento (null = ainda não aplicado).
+  bool? _audioAnalysisActive;
+  bool _appInForeground = true;
 
   final ScrollController _menuScrollController = ScrollController();
   final ScrollController _libraryScrollController = ScrollController();
   final ScrollController _queueScrollController = ScrollController();
   final ScrollController _gameMenuScrollController = ScrollController();
   final ScrollController _settingsScrollController = ScrollController();
-
-  final int barCount = 12;
-  late List<double> spectrumBars;
-  late List<double> spectrumTarget;
-  double wavePhase = 0.0;
-  double currentWaveAmplitude = 0.05;
-  double currentWaveComplexity = 0.02;
+  final ScrollController _eqScrollController = ScrollController();
 
   bool _showSearchBar = true;
   double _lastLibraryScrollOffset = 0.0;
@@ -238,55 +253,9 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     player = widget.audioHandler.player;
     player.setVolume(currentVolume);
-
-    spectrumBars = List.filled(barCount, 0.1);
-    spectrumTarget = List.filled(barCount, 0.1);
-
-    _spectrumController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 60),
-    )..repeat();
-    _spectrumController.addListener(() {
-      if (mounted) {
-        setState(() {
-          wavePhase -= isPlaying ? 0.08 : 0.02;
-
-          if (isPlaying) {
-            int currentChunk = position.inMilliseconds ~/ 150;
-            int seed = currentChunk + currentTrackName.hashCode;
-            var rand = Random(seed);
-
-            double targetAmp = 0.15 + (rand.nextDouble() * 0.35);
-            double targetComp = 0.015 + (rand.nextDouble() * 0.045);
-
-            currentWaveAmplitude += (targetAmp - currentWaveAmplitude) * 0.2;
-            currentWaveComplexity += (targetComp - currentWaveComplexity) * 0.1;
-          } else {
-            currentWaveAmplitude += (0.05 - currentWaveAmplitude) * 0.1;
-            currentWaveComplexity += (0.02 - currentWaveComplexity) * 0.1;
-          }
-
-          for (int i = 0; i < barCount; i++) {
-            if (isPlaying) {
-              final time = position.inMilliseconds.toDouble();
-              double frequencySpeed = 0.002 + (i / barCount) * 0.015;
-              double wave =
-                  (sin(time * frequencySpeed) +
-                      cos(time * frequencySpeed * 1.3)) /
-                  2.0;
-              double noise = Random().nextDouble() * (0.1 + (i * 0.02));
-              spectrumTarget[i] = (wave.abs() * 0.85) + noise;
-              spectrumBars[i] =
-                  (1 - 0.25) * spectrumBars[i] + 0.25 * spectrumTarget[i];
-            } else {
-              spectrumBars[i] = (1 - 0.2) * spectrumBars[i];
-            }
-          }
-        });
-      }
-    });
 
     _libraryScrollController.addListener(() {
       if (mounted && currentView == 'library') {
@@ -305,45 +274,79 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       }
     });
 
-    player.stream.playing.listen((bool playing) {
-      if (mounted) setState(() => isPlaying = playing);
-    });
-    player.stream.position.listen((Duration p) {
-      if (mounted) setState(() => position = p);
-    });
-    player.stream.duration.listen((Duration d) {
-      if (mounted) {
-        setState(() => duration = d);
-        widget.audioHandler.updateTrackInfo(currentTrackName, d);
-      }
-    });
-
-    player.stream.playlist.listen((Playlist playlist) {
-      if (mounted && playlist.medias.isNotEmpty && playlist.index >= 0) {
-        setState(() {
-          currentIndex = playlist.index;
-          if (currentIndex < queuePaths.length) {
-            currentTrackName = p.basenameWithoutExtension(
-              playlist.medias[currentIndex].uri,
-            );
-            currentTrackBpm = 80 + (currentTrackName.hashCode.abs() % 100);
-            widget.audioHandler.updateTrackInfo(currentTrackName, duration);
-          }
-        });
-      }
-    });
+    // A posição NÃO faz setState aqui: só a barra de progresso e o
+    // visualizador a acompanham, evitando reconstruir o ecrã inteiro.
+    _subscriptions.addAll([
+      player.stream.playing.listen((bool playing) {
+        if (mounted) setState(() => isPlaying = playing);
+        if (playing) _verifyAudioAnalysis();
+      }),
+      player.stream.duration.listen((Duration d) {
+        if (mounted) {
+          setState(() => duration = d);
+          widget.audioHandler.updateTrackInfo(currentTrackName, d);
+        }
+      }),
+      player.stream.playlist.listen(_onPlaylistChanged),
+    ]);
 
     _loadData();
   }
 
+  void _onPlaylistChanged(Playlist playlist) {
+    if (!mounted || _isReorderingPlaylist) return;
+    if (playlist.medias.isEmpty || playlist.index < 0) return;
+    final index = playlist.index;
+    if (index >= playlist.medias.length) return;
+    final name = p.basenameWithoutExtension(
+      index < queuePaths.length
+          ? queuePaths[index]
+          : playlist.medias[index].uri,
+    );
+    setState(() {
+      currentIndex = index;
+      currentTrackName = name;
+      currentTrackBpm = 80 + (name.hashCode.abs() % 100);
+    });
+    widget.audioHandler.updateTrackInfo(name, duration);
+  }
+
+  String t(String key) => lang[currentLang]![key] ?? key;
+
+  /// Nome mostrado no ecrã do leitor.
+  String get _displayTrackName {
+    if (_flashMessage != null) return _flashMessage!;
+    if (queuePaths.isEmpty || currentTrackName.isEmpty) return t('no_track');
+    return currentTrackName;
+  }
+
+  /// Mostra uma mensagem temporária no lugar do nome da faixa.
+  void _flash(String message) {
+    _flashTimer?.cancel();
+    setState(() => _flashMessage = message);
+    _flashTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _flashMessage = null);
+    });
+  }
+
+  String? get _currentQueuePath =>
+      (currentIndex >= 0 && currentIndex < queuePaths.length)
+      ? queuePaths[currentIndex]
+      : null;
+
   @override
   void dispose() {
-    _spectrumController.dispose();
+    for (final s in _subscriptions) {
+      s.cancel();
+    }
+    _keyboardFocus.dispose();
+    _flashTimer?.cancel();
     _menuScrollController.dispose();
     _libraryScrollController.dispose();
     _queueScrollController.dispose();
     _gameMenuScrollController.dispose();
     _settingsScrollController.dispose();
+    _eqScrollController.dispose();
     _searchController.dispose();
     volumeTimer?.cancel();
     snakeTimer?.cancel();
@@ -351,6 +354,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     racingTimer?.cancel();
     flappyTimer?.cancel();
     froggerTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
@@ -377,6 +381,11 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
         savedEqPreset < eqPresets.length) {
       selectedEqPreset = savedEqPreset;
     }
+    eqStrength = (prefs.getDouble('retro_eq_strength') ?? 1.0).clamp(
+      equalizerMinStrength,
+      equalizerMaxStrength,
+    );
+    _applyAudioFilters();
 
     snakeTopScore = prefs.getInt('snake_top_score') ?? 0;
     tetrisTopScore = prefs.getInt('tetris_top_score') ?? 0;
@@ -388,14 +397,104 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     final savedLibs = prefs.getStringList('retro_playlist');
     final savedQueue = prefs.getStringList('retro_queue');
     if (savedLibs != null && savedLibs.isNotEmpty) {
-      libraryPaths = savedLibs;
+      // Ficheiros apagados/movidos desde a última sessão são descartados.
+      libraryPaths = savedLibs.where((f) => File(f).existsSync()).toList();
       _sortAlphabetically();
-      queuePaths = (savedQueue != null && savedQueue.isNotEmpty)
-          ? savedQueue
-          : List.from(libraryPaths);
-      _playPlaylist(startIndex: 0, autoPlay: false);
+      final validQueue = (savedQueue ?? [])
+          .where(libraryPaths.toSet().contains)
+          .toList();
+      queuePaths = validQueue.isNotEmpty ? validQueue : List.from(libraryPaths);
+      if (queuePaths.isNotEmpty) {
+        await _playPlaylist(startIndex: 0, autoPlay: false);
+      }
     }
-    setState(() {});
+    if (mounted) setState(() {});
+  }
+
+  List<double> _presetBands(int index) =>
+      (eqPresets[index]['bands'] as List).cast<double>();
+
+  /// A medição do áudio custa CPU, por isso só fica ligada enquanto o
+  /// visualizador está à vista (ecrã do leitor, app em primeiro plano).
+  bool get _wantsAudioAnalysis =>
+      _audioAnalysisAvailable && _appInForeground && currentView == 'player';
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appInForeground = state == AppLifecycleState.resumed;
+    _syncAudioAnalysis();
+  }
+
+  void _syncAudioAnalysis() {
+    if (_audioAnalysisActive != null &&
+        _audioAnalysisActive != _wantsAudioAnalysis) {
+      _applyAudioFilters();
+      if (_wantsAudioAnalysis && player.state.playing) _verifyAudioAnalysis();
+    }
+  }
+
+  /// Aplica no mpv o equalizador (preset × força) e, se o visualizador
+  /// estiver à vista, o filtro que mede o áudio.
+  Future<void> _applyAudioFilters() async {
+    final platform = player.platform;
+    if (platform is! NativePlayer) return;
+    final withAnalysis = _wantsAudioAnalysis;
+    _audioAnalysisActive = withAnalysis;
+    final filter = buildAudioFilter(
+      eqBands: _presetBands(selectedEqPreset),
+      eqStrength: eqStrength,
+      withAnalysis: withAnalysis,
+    );
+    try {
+      await platform.setProperty('af', filter);
+    } catch (e) {
+      debugPrint("Erro ao aplicar filtros de áudio: $e");
+    }
+  }
+
+  /// Na primeira reprodução confirma que o mpv está a medir o áudio. Se não
+  /// estiver (filtros indisponíveis nesta plataforma), fica só o equalizador
+  /// e o visualizador usa a animação simulada.
+  void _verifyAudioAnalysis() {
+    if (_audioAnalysisVerified || !_audioAnalysisAvailable) return;
+    final platform = player.platform;
+    if (platform is! NativePlayer) return;
+    Future.delayed(const Duration(seconds: 3), () async {
+      if (!mounted ||
+          _audioAnalysisVerified ||
+          !player.state.playing ||
+          _audioAnalysisActive != true) {
+        return;
+      }
+      final raw = await platform.getProperty('af-metadata/$analysisLabel');
+      if (parseAudioLevels(raw) != null) {
+        _audioAnalysisVerified = true;
+      } else {
+        debugPrint("Análise de áudio indisponível; a usar só o equalizador.");
+        _audioAnalysisAvailable = false;
+        await _applyAudioFilters();
+      }
+    });
+  }
+
+  void _selectEqPreset(int index) {
+    final clamped = index.clamp(0, eqPresets.length - 1);
+    if (clamped == selectedEqPreset) return;
+    setState(() => selectedEqPreset = clamped);
+    _scrollToItem(_eqScrollController, clamped, itemExtent: _eqItemExtent);
+    _applyAudioFilters();
+    _saveData();
+  }
+
+  void _changeEqStrength(double delta) {
+    final next = (eqStrength + delta).clamp(
+      equalizerMinStrength,
+      equalizerMaxStrength,
+    );
+    if (next == eqStrength) return;
+    setState(() => eqStrength = next);
+    _applyAudioFilters();
+    _saveData();
   }
 
   Future<void> _saveData() async {
@@ -406,6 +505,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     await prefs.setInt('retro_theme_index', currentThemeIndex);
     await prefs.setString('retro_visual_style', visualStyle);
     await prefs.setInt('retro_eq_preset', selectedEqPreset);
+    await prefs.setDouble('retro_eq_strength', eqStrength);
   }
 
   void _sortAlphabetically() {
@@ -417,45 +517,59 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     );
   }
 
-  void _handleShuffleToggle() async {
-    if (libraryPaths.isEmpty) return;
-    String currentTrackPath = "";
-    if (queuePaths.isNotEmpty &&
-        currentIndex >= 0 &&
-        currentIndex < queuePaths.length) {
-      currentTrackPath = queuePaths[currentIndex];
-    } else if (libraryPaths.isNotEmpty) {
-      currentTrackPath = libraryPaths.first;
+  /// Liga/desliga o modo aleatório SEM reabrir a playlist: a fila do mpv é
+  /// reordenada no lugar, por isso a faixa atual continua a tocar.
+  Future<void> _handleShuffleToggle() async {
+    if (libraryPaths.isEmpty || _isReorderingPlaylist) return;
+    final currentTrackPath = _currentQueuePath ?? libraryPaths.first;
+
+    final List<String> newQueue;
+    if (!isShuffle) {
+      final remaining = List<String>.from(libraryPaths)
+        ..remove(currentTrackPath);
+      remaining.shuffle();
+      newQueue = [currentTrackPath, ...remaining];
+    } else {
+      newQueue = List.from(libraryPaths);
     }
 
-    setState(() {
-      isShuffle = !isShuffle;
-      if (isShuffle) {
-        List<String> remaining = List.from(libraryPaths)
-          ..remove(currentTrackPath);
-        remaining.shuffle();
-        queuePaths = [currentTrackPath, ...remaining];
-        currentIndex = 0;
-      } else {
-        queuePaths = List.from(libraryPaths);
-        currentIndex = queuePaths.indexOf(currentTrackPath);
-        if (currentIndex == -1) currentIndex = 0;
-      }
-    });
-
+    setState(() => isShuffle = !isShuffle);
+    await _reorderPlayerQueue(newQueue);
     await _saveData();
-    final currentPos = player.state.position;
-    final wasPlaying = player.state.playing;
+  }
 
-    await player.open(
-      Playlist(
-        queuePaths.map((path) => Media(path)).toList(),
-        index: currentIndex,
-      ),
-      play: false,
-    );
-    if (currentPos > Duration.zero) await player.seek(currentPos);
-    if (wasPlaying) await player.play();
+  /// Transforma a fila atual do player em [target] usando apenas
+  /// `playlist-move`, que não interrompe a reprodução.
+  Future<void> _reorderPlayerQueue(List<String> target) async {
+    final sameItems =
+        target.length == queuePaths.length &&
+        target.toSet().containsAll(queuePaths);
+    if (!sameItems ||
+        player.state.playlist.medias.length != queuePaths.length) {
+      // A fila mudou de conteúdo: não há como evitar reabrir a playlist.
+      final current = _currentQueuePath;
+      queuePaths = List.from(target);
+      final start = current == null ? 0 : max(0, queuePaths.indexOf(current));
+      await _playPlaylist(startIndex: start, autoPlay: player.state.playing);
+      return;
+    }
+
+    final current = _currentQueuePath;
+    _isReorderingPlaylist = true;
+    try {
+      for (final move in computePlaylistMoves(queuePaths, target)) {
+        await player.move(move.from, move.to);
+      }
+    } catch (e) {
+      debugPrint("Erro ao reordenar fila: $e");
+    } finally {
+      _isReorderingPlaylist = false;
+    }
+    if (!mounted) return;
+    setState(() {
+      queuePaths = List.from(target);
+      if (current != null) currentIndex = max(0, queuePaths.indexOf(current));
+    });
   }
 
   Future<void> requestPermissionsAndPickFolder() async {
@@ -467,40 +581,30 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       }
     }
     String? dirPath = await FilePicker.getDirectoryPath();
-    if (dirPath != null) {
-      setState(() => isLoadingFolder = true);
-      final dir = Directory(dirPath);
-      List<String> audioFiles = [];
-      final validExtensions = ['.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg'];
+    if (dirPath != null) await loadFolder(dirPath);
+  }
 
-      try {
-        await for (var entity
-            in dir.list(recursive: true).handleError((e) {})) {
-          if (entity is File &&
-              validExtensions.contains(
-                p.extension(entity.path).toLowerCase(),
-              )) {
-            audioFiles.add(entity.path);
-          }
-        }
-      } catch (e) {
-        debugPrint("Erro: $e");
-      }
+  /// Procura áudio (recursivamente) em [dirPath] e começa a tocar.
+  @visibleForTesting
+  Future<void> loadFolder(String dirPath) async {
+    setState(() => isLoadingFolder = true);
+    final audioFiles = await scanAudioFiles(dirPath);
+    if (!mounted) return;
+    setState(() => isLoadingFolder = false);
 
-      setState(() => isLoadingFolder = false);
-
-      if (audioFiles.isNotEmpty) {
-        libraryPaths = audioFiles;
-        _sortAlphabetically();
-        queuePaths = List.from(libraryPaths);
-        setState(() {
-          isShuffle = false;
-          currentView = 'player';
-        });
-        await _saveData();
-        await _playPlaylist(startIndex: 0, autoPlay: true);
-      }
+    if (audioFiles.isEmpty) {
+      _flash(t('no_audio_found'));
+      return;
     }
+    libraryPaths = audioFiles;
+    _sortAlphabetically();
+    queuePaths = List.from(libraryPaths);
+    setState(() {
+      isShuffle = false;
+      currentView = 'player';
+    });
+    await _saveData();
+    await _playPlaylist(startIndex: 0, autoPlay: true);
   }
 
   Future<void> _playPlaylist({
@@ -509,17 +613,57 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
   }) async {
     final medias = queuePaths.map((path) => Media(path)).toList();
     final playlist = Playlist(medias, index: startIndex);
+    currentIndex = startIndex;
     await player.open(playlist, play: autoPlay);
   }
 
-  void _scrollToItem(ScrollController controller, int index) {
-    if (controller.hasClients) {
-      controller.animateTo(
-        index * 50.0,
-        duration: const Duration(milliseconds: 200),
-        curve: Curves.easeInOut,
-      );
+  /// Toca [path] da biblioteca, montando a fila (aleatória ou não).
+  void _playFromLibrary(String path) {
+    if (isShuffle) {
+      final remaining = List<String>.from(libraryPaths)..remove(path);
+      remaining.shuffle();
+      queuePaths = [path, ...remaining];
+    } else {
+      queuePaths = List.from(libraryPaths);
     }
+    _playPlaylist(startIndex: max(0, queuePaths.indexOf(path)), autoPlay: true);
+    _saveData();
+    setState(() {
+      currentView = 'player';
+      _searchController.clear();
+      _searchQuery = '';
+      _showSearchBar = true;
+    });
+    _keyboardFocus.requestFocus();
+  }
+
+  // Altura real de cada linha das listas (altura + margens verticais).
+  static const double _menuItemExtent = 66.0;
+  static const double _libraryItemExtent = 58.0;
+  static const double _eqItemExtent = 68.0;
+
+  void _scrollToItem(
+    ScrollController controller,
+    int index, {
+    double itemExtent = _menuItemExtent,
+  }) {
+    if (!controller.hasClients) return;
+    final position = controller.position;
+    final itemTop = index * itemExtent;
+    final itemBottom = itemTop + itemExtent;
+    double? target;
+    // Só desloca quando o item sai da área visível.
+    if (itemTop < position.pixels) {
+      target = itemTop;
+    } else if (itemBottom > position.pixels + position.viewportDimension) {
+      target = itemBottom - position.viewportDimension;
+    }
+    if (target == null) return;
+    controller.animateTo(
+      target.clamp(0.0, position.maxScrollExtent),
+      duration: const Duration(milliseconds: 200),
+      curve: Curves.easeInOut,
+    );
   }
 
   void _handleVolumeChange(double delta) {
@@ -534,10 +678,15 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     });
   }
 
+  // O `onReorderItem` já entrega o newIndex ajustado (posição final).
   void _reorderQueue(int oldI, int newI) async {
-    if (oldI < newI) newI -= 1;
-    int realOldIndex = currentIndex + oldI;
-    int realNewIndex = currentIndex + newI;
+    if (oldI == newI) return;
+    final int realOldIndex = currentIndex + oldI;
+    final int realNewIndex = currentIndex + newI;
+    if (realOldIndex >= queuePaths.length ||
+        realNewIndex >= queuePaths.length) {
+      return;
+    }
     final String currentTrackPath = queuePaths[currentIndex];
 
     setState(() {
@@ -546,19 +695,40 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       currentIndex = queuePaths.indexOf(currentTrackPath);
     });
 
-    await _saveData();
+    _isReorderingPlaylist = true;
     try {
-      await player.move(realOldIndex, realNewIndex);
+      await player.move(
+        realOldIndex,
+        mpvMoveTarget(realOldIndex, realNewIndex),
+      );
     } catch (e) {
       debugPrint("Erro ao reordenar fila: $e");
+    } finally {
+      _isReorderingPlaylist = false;
     }
+    await _saveData();
   }
 
+  /// Guarda o recorde imediatamente no estado e depois em disco.
+  void _saveTopScore(String key, int score) {
+    SharedPreferences.getInstance().then((prefs) => prefs.setInt(key, score));
+  }
+
+  /// Um jogo está "em curso" (pausado ou não) enquanto o seu timer existir.
+  bool _isRunning(Timer? timer) => timer?.isActive ?? false;
+
   // --- SNAKE LOGIC (BPM Adaptativo) ---
+  void _setSnakeDir(Point<int> dir) {
+    // Compara com o último passo efetivo, não com a última tecla.
+    if (dir.x == -snakeLastMoveDir.x && dir.y == -snakeLastMoveDir.y) return;
+    snakeDir = dir;
+  }
+
   void _startSnakeGame() {
     setState(() {
       snakeBody = [const Point(7, 7), const Point(7, 8), const Point(7, 9)];
       snakeDir = const Point(0, -1);
+      snakeLastMoveDir = snakeDir;
       isPlayingSnake = true;
       isSnakeGameOver = false;
       snakeScore = 0;
@@ -573,17 +743,16 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
   }
 
   void _spawnSnakeFood() {
-    final rand = Random();
-    while (true) {
-      Point<int> p = Point(
-        rand.nextInt(snakeGridSize),
-        rand.nextInt(snakeGridSize),
-      );
-      if (!snakeBody.contains(p)) {
-        snakeFood = p;
-        break;
-      }
-    }
+    // Escolhe entre as casas livres (o ciclo aleatório antigo podia
+    // bloquear quando a cobra ocupava quase o tabuleiro todo).
+    final body = snakeBody.toSet();
+    final free = [
+      for (int y = 0; y < snakeGridSize; y++)
+        for (int x = 0; x < snakeGridSize; x++)
+          if (!body.contains(Point(x, y))) Point(x, y),
+    ];
+    if (free.isEmpty) return;
+    snakeFood = free[Random().nextInt(free.length)];
   }
 
   void _updateSnake() {
@@ -601,13 +770,13 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
         isPlayingSnake = false;
         isSnakeGameOver = true;
         snakeTimer?.cancel();
-        if (snakeScore > snakeTopScore)
-          SharedPreferences.getInstance().then(
-            (prefs) =>
-                prefs.setInt('snake_top_score', snakeTopScore = snakeScore),
-          );
+        if (snakeScore > snakeTopScore) {
+          snakeTopScore = snakeScore;
+          _saveTopScore('snake_top_score', snakeTopScore);
+        }
         return;
       }
+      snakeLastMoveDir = snakeDir;
       snakeBody.insert(0, newHead);
       if (newHead == snakeFood) {
         snakeScore += 10;
@@ -621,10 +790,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
   // --- TETRIS LOGIC (BPM Adaptativo) ---
   void _startTetrisGame() {
     setState(() {
-      tetrisBoard = List.generate(
-        tetrisRows,
-        (_) => List.filled(tetrisCols, 0),
-      );
+      tetrisBoard = emptyTetrisBoard();
       tetrisScore = 0;
       isPlayingTetris = true;
       isTetrisGameOver = false;
@@ -646,11 +812,10 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       isPlayingTetris = false;
       isTetrisGameOver = true;
       tetrisTimer?.cancel();
-      if (tetrisScore > tetrisTopScore)
-        SharedPreferences.getInstance().then(
-          (prefs) =>
-              prefs.setInt('tetris_top_score', tetrisTopScore = tetrisScore),
-        );
+      if (tetrisScore > tetrisTopScore) {
+        tetrisTopScore = tetrisScore;
+        _saveTopScore('tetris_top_score', tetrisTopScore);
+      }
     }
   }
 
@@ -675,16 +840,11 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       } else {
         for (var p in tetrisPiece) {
           int x = p.x + tetrisPieceOffset.x, y = p.y + tetrisPieceOffset.y;
-          if (y >= 0 && y < tetrisRows && x >= 0 && x < tetrisCols)
+          if (y >= 0 && y < tetrisRows && x >= 0 && x < tetrisCols) {
             tetrisBoard[y][x] = tetrisPieceType + 1;
-        }
-        for (int r = tetrisRows - 1; r >= 0; r--) {
-          if (tetrisBoard[r].every((cell) => cell != 0)) {
-            tetrisBoard.removeAt(r);
-            tetrisBoard.insert(0, List.filled(tetrisCols, 0));
-            tetrisScore += 100;
           }
         }
+        tetrisScore += tetrisLineScore(clearFullTetrisLines(tetrisBoard));
         _spawnTetrisPiece();
       }
     });
@@ -697,8 +857,9 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
         tetrisPieceOffset.x + dx,
         tetrisPieceOffset.y,
       );
-      if (!_checkTetrisCollision(tetrisPiece, nextOffset))
+      if (!_checkTetrisCollision(tetrisPiece, nextOffset)) {
         tetrisPieceOffset = nextOffset;
+      }
     });
   }
 
@@ -708,8 +869,9 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       List<Point<int>> rotated = tetrisPiece
           .map((p) => Point(-p.y, p.x))
           .toList();
-      if (!_checkTetrisCollision(rotated, tetrisPieceOffset))
+      if (!_checkTetrisCollision(rotated, tetrisPieceOffset)) {
         tetrisPiece = rotated;
+      }
     });
   }
 
@@ -725,7 +887,9 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
 
   void _spawn2048() {
     List<int> empty = [];
-    for (int i = 0; i < 16; i++) if (board2048[i] == 0) empty.add(i);
+    for (int i = 0; i < 16; i++) {
+      if (board2048[i] == 0) empty.add(i);
+    }
     if (empty.isEmpty) return;
     board2048[empty[Random().nextInt(empty.length)]] =
         Random().nextDouble() < 0.9 ? 2 : 4;
@@ -737,15 +901,8 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     List<int> newBoard = List.from(board2048);
 
     List<int> slide(List<int> line) {
-      List<int> res = line.where((v) => v != 0).toList();
-      for (int i = 0; i < res.length - 1; i++) {
-        if (res[i] == res[i + 1]) {
-          res[i] *= 2;
-          score2048 += res[i];
-          res.removeAt(i + 1);
-        }
-      }
-      while (res.length < 4) res.add(0);
+      final (res, gained) = slide2048Line(line);
+      score2048 += gained;
       return res;
     }
 
@@ -781,11 +938,11 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
         }
         if (!hasMove) {
           isGameOver2048 = true;
-          if (score2048 > topScore2048)
-            SharedPreferences.getInstance().then(
-              (p) => p.setInt('2048_top_score', topScore2048 = score2048),
-            );
         }
+      }
+      if (score2048 > topScore2048) {
+        topScore2048 = score2048;
+        _saveTopScore('2048_top_score', topScore2048);
       }
       setState(() {});
     }
@@ -803,25 +960,27 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     racingTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
       if (!isPlayingRacing) return;
       setState(() {
-        for (var c in enemyCars) c['y'] = c['y']! + speedFactor;
+        for (var c in enemyCars) {
+          c['y'] = c['y']! + speedFactor;
+        }
         if (enemyCars.isNotEmpty && enemyCars.first['y']! > 20) {
           enemyCars.removeAt(0);
           racingScore += 10;
         }
         if (enemyCars.isEmpty || enemyCars.last['y']! > 6) {
-          if (Random().nextDouble() < 0.3)
+          if (Random().nextDouble() < 0.3) {
             enemyCars.add({'lane': Random().nextInt(3).toDouble(), 'y': -4});
+          }
         }
         for (var c in enemyCars) {
           if (c['lane'] == playerLane && c['y']! + 2.8 > 16 && c['y']! < 18.8) {
             isPlayingRacing = false;
             isRacingGameOver = true;
             racingTimer?.cancel();
-            if (racingScore > racingTopScore)
-              SharedPreferences.getInstance().then(
-                (p) =>
-                    p.setInt('racing_top_score', racingTopScore = racingScore),
-              );
+            if (racingScore > racingTopScore) {
+              racingTopScore = racingScore;
+              _saveTopScore('racing_top_score', racingTopScore);
+            }
           }
         }
       });
@@ -844,19 +1003,23 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       setState(() {
         birdVelocity += 0.2;
         birdY += birdVelocity;
-        for (var p in pipes) p['x'] = p['x']! - pipeSpeed;
+        for (var p in pipes) {
+          p['x'] = p['x']! - pipeSpeed;
+        }
         if (pipes.isNotEmpty && pipes.first['x']! < -3) {
           pipes.removeAt(0);
           flappyScore += 10;
         }
-        if (pipes.isEmpty || pipes.last['x']! < 10)
+        if (pipes.isEmpty || pipes.last['x']! < 10) {
           pipes.add({'x': 20, 'gapY': Random().nextInt(8) + 2.0});
+        }
 
         if (birdY < 0 || birdY > 19) _gameOverFlappy();
         for (var p in pipes) {
           if (p['x']! < 4 && p['x']! + 2 > 1.5) {
-            if (birdY < p['gapY']! || birdY + 1.5 > p['gapY']! + 5)
+            if (birdY < p['gapY']! || birdY + 1.5 > p['gapY']! + 5) {
               _gameOverFlappy();
+            }
           }
         }
       });
@@ -864,13 +1027,14 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
   }
 
   void _gameOverFlappy() {
+    if (isFlappyGameOver) return;
     isPlayingFlappy = false;
     isFlappyGameOver = true;
     flappyTimer?.cancel();
-    if (flappyScore > flappyTopScore)
-      SharedPreferences.getInstance().then(
-        (p) => p.setInt('flappy_top_score', flappyTopScore = flappyScore),
-      );
+    if (flappyScore > flappyTopScore) {
+      flappyTopScore = flappyScore;
+      _saveTopScore('flappy_top_score', flappyTopScore);
+    }
   }
 
   // --- FROGGER LOGIC (BPM Adaptativo) ---
@@ -901,13 +1065,10 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
               isPlayingFrogger = false;
               isFroggerGameOver = true;
               froggerTimer?.cancel();
-              if (froggerScore > froggerTopScore)
-                SharedPreferences.getInstance().then(
-                  (p) => p.setInt(
-                    'frogger_top_score',
-                    froggerTopScore = froggerScore,
-                  ),
-                );
+              if (froggerScore > froggerTopScore) {
+                froggerTopScore = froggerScore;
+                _saveTopScore('frogger_top_score', froggerTopScore);
+              }
             }
           }
         }
@@ -924,61 +1085,50 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       if (ny == 0) {
         froggerScore += 50;
         frogPos = const Point(7, 14);
-        for (var c in roadCars) c['speed'] += 0.1;
+        for (var c in roadCars) {
+          c['speed'] += 0.1;
+        }
       }
     });
   }
 
   void _handleMenuSelection() {
     final id = menuItems[selectedMenuItem]['id'];
-    if (id == 'open_folder')
+    if (id == 'open_folder') {
       requestPermissionsAndPickFolder();
-    else if (id == 'library')
+    } else if (id == 'library') {
       setState(() {
         currentView = 'library';
         selectedLibraryItem = max(
           0,
-          filteredLibraryPaths.indexOf(
-            queuePaths.isNotEmpty ? queuePaths[currentIndex] : '',
+          filteredLibraryPaths.indexOf(_currentQueuePath ?? ''),
+        );
+      });
+      // Mostra logo a faixa atual quando a lista já estiver montada.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!_libraryScrollController.hasClients) return;
+        _libraryScrollController.jumpTo(
+          (selectedLibraryItem * _libraryItemExtent).clamp(
+            0.0,
+            _libraryScrollController.position.maxScrollExtent,
           ),
         );
       });
-    else if (id == 'queue')
+    } else if (id == 'queue') {
       setState(() => currentView = 'queue');
-    else if (id == 'equalizer')
-      setState(() {
-        currentView = 'equalizer';
-        selectedEqPreset = selectedEqPreset
-            .clamp(0, eqPresets.length - 1)
-            .toInt();
-      });
-    else if (id == 'settings')
+    } else if (id == 'equalizer') {
+      setState(() => currentView = 'equalizer');
+    } else if (id == 'settings') {
       setState(() {
         currentView = 'settings';
         selectedMenuItem = 0;
       });
-    else if (id == 'games') {
+    } else if (id == 'games') {
       if (_focusModeEndTime != null &&
           DateTime.now().isBefore(_focusModeEndTime!)) {
-        setState(() {
-          currentView = 'player';
-          currentTrackName = "FOCO ATIVO!";
-        });
-        Future.delayed(const Duration(seconds: 2), () {
-          if (mounted && currentView == 'player') {
-            setState(() {
-              if (queuePaths.isNotEmpty &&
-                  currentIndex >= 0 &&
-                  currentIndex < queuePaths.length) {
-                currentTrackName = p.basenameWithoutExtension(
-                  queuePaths[currentIndex],
-                );
-              } else {
-                currentTrackName = "NENHUMA FAIXA";
-              }
-            });
-          }
-        });
+        final left = _focusModeEndTime!.difference(DateTime.now());
+        setState(() => currentView = 'player');
+        _flash("${t('focus_active')} ${left.inMinutes + 1} MIN");
         return;
       }
       setState(() {
@@ -986,6 +1136,61 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
         selectedGameItem = 0;
       });
     }
+  }
+
+  static const int _settingsCount = 6;
+
+  void _activateSetting(int index) {
+    setState(() => selectedMenuItem = index);
+    switch (index) {
+      case 0:
+        setState(() => currentLang = currentLang == 'pt' ? 'en' : 'pt');
+        _saveData();
+      case 1:
+        setState(
+          () =>
+              currentThemeIndex = (currentThemeIndex + 1) % retroThemes.length,
+        );
+        _saveData();
+      case 2:
+        setState(
+          () => visualStyle = visualStyle == 'spectrum' ? 'waves' : 'spectrum',
+        );
+        _saveData();
+      case 3:
+        setState(() {
+          _focusModeDuration = switch (_focusModeDuration) {
+            0 => 15,
+            15 => 30,
+            30 => 60,
+            _ => 0,
+          };
+          _focusModeEndTime = _focusModeDuration > 0
+              ? DateTime.now().add(Duration(minutes: _focusModeDuration))
+              : null;
+        });
+      case 4:
+        _clearLibrary();
+      case 5:
+        launchUrl(
+          Uri.parse('https://github.com/alexis6859/bitplayer'),
+          mode: LaunchMode.externalApplication,
+        );
+    }
+  }
+
+  Future<void> _clearLibrary() async {
+    await player.stop();
+    setState(() {
+      libraryPaths.clear();
+      queuePaths.clear();
+      currentIndex = 0;
+      currentTrackName = '';
+      duration = Duration.zero;
+      isShuffle = false;
+      currentView = 'player';
+    });
+    await _saveData();
   }
 
   void _handleGameSelection() {
@@ -1003,6 +1208,8 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
         isPlayingTetris = false;
         isTetrisGameOver = false;
         tetrisScore = 0;
+        tetrisBoard = emptyTetrisBoard();
+        tetrisPiece = [];
       }
       if (gameId == '2048') {
         isGameOver2048 = false;
@@ -1035,7 +1242,21 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     });
   }
 
+  void _stopGames() {
+    snakeTimer?.cancel();
+    tetrisTimer?.cancel();
+    racingTimer?.cancel();
+    flappyTimer?.cancel();
+    froggerTimer?.cancel();
+    isPlayingSnake = false;
+    isPlayingTetris = false;
+    isPlayingRacing = false;
+    isPlayingFlappy = false;
+    isPlayingFrogger = false;
+  }
+
   void _handleBackButton() {
+    if (currentView == 'library') _keyboardFocus.requestFocus();
     setState(() {
       if ([
         'snake',
@@ -1045,16 +1266,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
         'flappy',
         'frogger',
       ].contains(currentView)) {
-        snakeTimer?.cancel();
-        tetrisTimer?.cancel();
-        racingTimer?.cancel();
-        flappyTimer?.cancel();
-        froggerTimer?.cancel();
-        isPlayingSnake = false;
-        isPlayingTetris = false;
-        isPlayingRacing = false;
-        isPlayingFlappy = false;
-        isPlayingFrogger = false;
+        _stopGames();
         currentView = 'game_menu';
       } else if (currentView == 'game_menu' ||
           currentView == 'library' ||
@@ -1074,14 +1286,275 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     });
   }
 
+  // --- CONTROLOS (partilhados entre botões no ecrã e teclado) ---
+
+  void _handleOk() {
+    switch (currentView) {
+      case 'menu':
+        _handleMenuSelection();
+      case 'game_menu':
+        _handleGameSelection();
+      case 'library':
+        final list = filteredLibraryPaths;
+        if (list.isEmpty) return;
+        _playFromLibrary(list[selectedLibraryItem.clamp(0, list.length - 1)]);
+      case 'settings':
+        _activateSetting(selectedMenuItem);
+      case 'player':
+        player.playOrPause();
+    }
+  }
+
+  void _handleUp() {
+    switch (currentView) {
+      case 'library':
+        setState(() => selectedLibraryItem = max(0, selectedLibraryItem - 1));
+        _scrollToItem(
+          _libraryScrollController,
+          selectedLibraryItem,
+          itemExtent: _libraryItemExtent,
+        );
+      case 'menu':
+        setState(() => selectedMenuItem = max(0, selectedMenuItem - 1));
+        _scrollToItem(_menuScrollController, selectedMenuItem);
+      case 'equalizer':
+        _selectEqPreset(selectedEqPreset - 1);
+      case 'settings':
+        setState(() => selectedMenuItem = max(0, selectedMenuItem - 1));
+        _scrollToItem(_settingsScrollController, selectedMenuItem);
+      case 'game_menu':
+        setState(() => selectedGameItem = max(0, selectedGameItem - 1));
+        _scrollToItem(_gameMenuScrollController, selectedGameItem);
+      case 'snake':
+        _setSnakeDir(const Point(0, -1));
+      case 'tetris':
+        _rotateTetris();
+      case '2048':
+        _move2048(0, -1);
+      case 'flappy':
+        if (isPlayingFlappy) birdVelocity = -1.8;
+      case 'frogger':
+        _moveFrogger(0, -1);
+      case 'player':
+        _handleVolumeChange(10.0);
+    }
+  }
+
+  void _handleDown() {
+    switch (currentView) {
+      case 'library':
+        final list = filteredLibraryPaths;
+        if (list.isEmpty) return;
+        setState(
+          () => selectedLibraryItem = min(
+            list.length - 1,
+            selectedLibraryItem + 1,
+          ),
+        );
+        _scrollToItem(
+          _libraryScrollController,
+          selectedLibraryItem,
+          itemExtent: _libraryItemExtent,
+        );
+      case 'menu':
+        setState(
+          () => selectedMenuItem = min(
+            menuItems.length - 1,
+            selectedMenuItem + 1,
+          ),
+        );
+        _scrollToItem(_menuScrollController, selectedMenuItem);
+      case 'equalizer':
+        _selectEqPreset(selectedEqPreset + 1);
+      case 'game_menu':
+        setState(
+          () =>
+              selectedGameItem = min(gameList.length - 1, selectedGameItem + 1),
+        );
+        _scrollToItem(_gameMenuScrollController, selectedGameItem);
+      case 'settings':
+        setState(
+          () =>
+              selectedMenuItem = min(_settingsCount - 1, selectedMenuItem + 1),
+        );
+        _scrollToItem(_settingsScrollController, selectedMenuItem);
+      case 'snake':
+        _setSnakeDir(const Point(0, 1));
+      case 'tetris':
+        _updateTetris();
+      case '2048':
+        _move2048(0, 1);
+      case 'frogger':
+        _moveFrogger(0, 1);
+      case 'player':
+        _handleVolumeChange(-10.0);
+    }
+  }
+
+  void _handleLeft() {
+    switch (currentView) {
+      case 'snake':
+        _setSnakeDir(const Point(-1, 0));
+      case 'tetris':
+        _moveTetris(-1);
+      case '2048':
+        _move2048(-1, 0);
+      case 'racing':
+        if (isPlayingRacing) {
+          setState(() => playerLane = max(0, playerLane - 1));
+        }
+      case 'frogger':
+        _moveFrogger(-1, 0);
+      case 'flappy':
+        break;
+      case 'equalizer':
+        _changeEqStrength(-equalizerStrengthStep);
+      default:
+        player.previous();
+    }
+  }
+
+  void _handleRight() {
+    switch (currentView) {
+      case 'snake':
+        _setSnakeDir(const Point(1, 0));
+      case 'tetris':
+        _moveTetris(1);
+      case '2048':
+        _move2048(1, 0);
+      case 'racing':
+        if (isPlayingRacing) {
+          setState(() => playerLane = min(2, playerLane + 1));
+        }
+      case 'frogger':
+        _moveFrogger(1, 0);
+      case 'flappy':
+        break;
+      case 'equalizer':
+        _changeEqStrength(equalizerStrengthStep);
+      default:
+        player.next();
+    }
+  }
+
+  /// PLAY: nos jogos inicia/pausa/retoma; fora deles faz play/pausa da música.
+  void _handlePlay() {
+    switch (currentView) {
+      case 'snake':
+        if (isSnakeGameOver || !_isRunning(snakeTimer)) {
+          _startSnakeGame();
+        } else {
+          setState(() => isPlayingSnake = !isPlayingSnake);
+        }
+      case 'tetris':
+        if (isTetrisGameOver || !_isRunning(tetrisTimer)) {
+          _startTetrisGame();
+        } else {
+          setState(() => isPlayingTetris = !isPlayingTetris);
+        }
+      case '2048':
+        if (isGameOver2048 || score2048 == 0) _start2048();
+      case 'racing':
+        if (isRacingGameOver || !_isRunning(racingTimer)) {
+          _startRacing();
+        } else {
+          setState(() => isPlayingRacing = !isPlayingRacing);
+        }
+      case 'flappy':
+        if (isFlappyGameOver || !_isRunning(flappyTimer)) {
+          _startFlappy();
+        } else {
+          setState(() => isPlayingFlappy = !isPlayingFlappy);
+        }
+      case 'frogger':
+        if (isFroggerGameOver || !_isRunning(froggerTimer)) {
+          _startFrogger();
+        } else {
+          setState(() => isPlayingFrogger = !isPlayingFrogger);
+        }
+      default:
+        player.playOrPause();
+    }
+  }
+
+  void _handleMenuButton() {
+    setState(() {
+      if (currentView == 'menu') {
+        currentView = 'player';
+      } else {
+        _stopGames();
+        currentView = 'menu';
+        selectedMenuItem = 0;
+      }
+    });
+  }
+
+  /// Teclado no desktop: setas = D-pad, Enter = OK, Espaço = PLAY,
+  /// Esc/Backspace = VOLTAR, M = MENU, S = MIX.
+  KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
+      return KeyEventResult.ignored;
+    }
+    // Não roubar teclas à caixa de pesquisa.
+    final focusContext = FocusManager.instance.primaryFocus?.context;
+    if (focusContext != null &&
+        (focusContext.widget is EditableText ||
+            focusContext.findAncestorWidgetOfExactType<EditableText>() !=
+                null)) {
+      if (event.logicalKey == LogicalKeyboardKey.escape) {
+        FocusManager.instance.primaryFocus?.unfocus();
+        _keyboardFocus.requestFocus();
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    }
+    final repeatable = <LogicalKeyboardKey, VoidCallback>{
+      LogicalKeyboardKey.arrowUp: _handleUp,
+      LogicalKeyboardKey.arrowDown: _handleDown,
+      LogicalKeyboardKey.arrowLeft: _handleLeft,
+      LogicalKeyboardKey.arrowRight: _handleRight,
+    };
+    final single = <LogicalKeyboardKey, VoidCallback>{
+      LogicalKeyboardKey.enter: _handleOk,
+      LogicalKeyboardKey.numpadEnter: _handleOk,
+      LogicalKeyboardKey.space: _handlePlay,
+      LogicalKeyboardKey.escape: _handleBackButton,
+      LogicalKeyboardKey.backspace: _handleBackButton,
+      LogicalKeyboardKey.keyM: _handleMenuButton,
+      LogicalKeyboardKey.keyS: _handleShuffleToggle,
+    };
+    final action =
+        repeatable[event.logicalKey] ??
+        (event is KeyDownEvent ? single[event.logicalKey] : null);
+    if (action == null) return KeyEventResult.ignored;
+    action();
+    return KeyEventResult.handled;
+  }
+
   String formatDuration(Duration d) {
     String twoDigits(int n) => n.toString().padLeft(2, '0');
-    return "${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
+    final mmss =
+        "${twoDigits(d.inMinutes.remainder(60))}:${twoDigits(d.inSeconds.remainder(60))}";
+    return d.inHours > 0 ? "${d.inHours}:$mmss" : mmss;
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = currentTheme;
+    // Liga/desliga a medição do áudio quando se entra/sai do ecrã do leitor.
+    if (_audioAnalysisActive != null &&
+        _audioAnalysisActive != _wantsAudioAnalysis) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _syncAudioAnalysis());
+    }
+    return Focus(
+      focusNode: _keyboardFocus,
+      autofocus: true,
+      onKeyEvent: _handleKey,
+      child: _buildDevice(theme),
+    );
+  }
+
+  Widget _buildDevice(RetroTheme theme) {
     return Scaffold(
       backgroundColor: const Color(0xFF1E292B),
       body: Center(
@@ -1124,18 +1597,27 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                         ),
                         child: ClipRRect(
                           borderRadius: BorderRadius.circular(17),
+                          // A grelha CRT fica numa camada própria e o conteúdo
+                          // noutra, para a grelha não ser redesenhada a cada
+                          // frame dos jogos/visualizador.
                           child: CustomPaint(
                             painter: CRTGridPainter(),
-                            child: AnimatedSwitcher(
-                              duration: const Duration(milliseconds: 250),
-                              child: isLoadingFolder
-                                  ? const Center(
-                                      key: ValueKey('Loading'),
-                                      child: CircularProgressIndicator(
-                                        color: Colors.black,
+                            isComplex: true,
+                            child: RepaintBoundary(
+                              child: AnimatedSwitcher(
+                                duration: const Duration(milliseconds: 150),
+                                child: isLoadingFolder
+                                    ? const Center(
+                                        key: ValueKey('Loading'),
+                                        child: CircularProgressIndicator(
+                                          color: Colors.black,
+                                        ),
+                                      )
+                                    : KeyedSubtree(
+                                        key: ValueKey(currentView),
+                                        child: _buildCurrentScreen(),
                                       ),
-                                    )
-                                  : _buildCurrentScreen(),
+                              ),
                             ),
                           ),
                         ),
@@ -1196,14 +1678,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                             width: 120,
                             height: 35,
                             borderRadius: 15,
-                            onTap: () => setState(() {
-                              if (currentView == 'menu') {
-                                currentView = 'player';
-                              } else {
-                                currentView = 'menu';
-                                selectedMenuItem = 0;
-                              }
-                            }),
+                            onTap: _handleMenuButton,
                             child: const Center(
                               child: Text(
                                 'MENU',
@@ -1224,95 +1699,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                                 width: 30,
                                 height: 30,
                                 isCircle: true,
-                                onTap: () {
-                                  if (currentView == 'menu')
-                                    _handleMenuSelection();
-                                  else if (currentView == 'game_menu')
-                                    _handleGameSelection();
-                                  else if (currentView == 'equalizer') {
-                                    _saveData();
-                                  } else if (currentView == 'library' &&
-                                      libraryPaths.isNotEmpty) {
-                                    if (filteredLibraryPaths.isEmpty) return;
-                                    final tappedItem =
-                                        filteredLibraryPaths[selectedLibraryItem];
-                                    queuePaths = List.from(libraryPaths);
-                                    if (isShuffle) {
-                                      List<String> remaining = List.from(
-                                        libraryPaths,
-                                      )..remove(tappedItem);
-                                      remaining.shuffle();
-                                      queuePaths = [tappedItem, ...remaining];
-                                      currentIndex = 0;
-                                    } else {
-                                      currentIndex = libraryPaths.indexOf(
-                                        tappedItem,
-                                      );
-                                    }
-                                    _playPlaylist(
-                                      startIndex: currentIndex,
-                                      autoPlay: true,
-                                    );
-                                    setState(() {
-                                      currentView = 'player';
-                                      _searchController.clear();
-                                      _searchQuery = '';
-                                      _showSearchBar = true;
-                                    });
-                                  } else if (currentView == 'settings') {
-                                    if (selectedMenuItem == 0) {
-                                      setState(
-                                        () => currentLang = currentLang == 'pt'
-                                            ? 'en'
-                                            : 'pt',
-                                      );
-                                      _saveData();
-                                    } else if (selectedMenuItem == 1) {
-                                      setState(
-                                        () => currentThemeIndex =
-                                            (currentThemeIndex + 1) %
-                                            retroThemes.length,
-                                      );
-                                      _saveData();
-                                    } else if (selectedMenuItem == 2) {
-                                      setState(
-                                        () => visualStyle =
-                                            visualStyle == 'spectrum'
-                                            ? 'waves'
-                                            : 'spectrum',
-                                      );
-                                      _saveData();
-                                    } else if (selectedMenuItem == 3) {
-                                      setState(() {
-                                        _focusModeDuration =
-                                            _focusModeDuration == 0
-                                            ? 15
-                                            : _focusModeDuration == 15
-                                            ? 30
-                                            : _focusModeDuration == 30
-                                            ? 60
-                                            : 0;
-                                        if (_focusModeDuration > 0) {
-                                          _focusModeEndTime = DateTime.now()
-                                              .add(
-                                                Duration(
-                                                  minutes: _focusModeDuration,
-                                                ),
-                                              );
-                                        } else {
-                                          _focusModeEndTime = null;
-                                        }
-                                      });
-                                    } else {
-                                      setState(() {
-                                        libraryPaths.clear();
-                                        queuePaths.clear();
-                                        currentView = 'player';
-                                      });
-                                      _saveData();
-                                    }
-                                  }
-                                },
+                                onTap: _handleOk,
                               ),
                               const SizedBox(height: 4),
                               const Text(
@@ -1332,172 +1719,10 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                         children: [
                           InteractiveDPad(
                             color: theme.dpadColor,
-                            onUp: () {
-                              if (currentView == 'library') {
-                                setState(
-                                  () => selectedLibraryItem = max(
-                                    0,
-                                    selectedLibraryItem - 1,
-                                  ),
-                                );
-                                _scrollToItem(
-                                  _libraryScrollController,
-                                  selectedLibraryItem,
-                                );
-                              } else if (currentView == 'menu') {
-                                setState(
-                                  () => selectedMenuItem = max(
-                                    0,
-                                    selectedMenuItem - 1,
-                                  ),
-                                );
-                                _scrollToItem(
-                                  _menuScrollController,
-                                  selectedMenuItem,
-                                );
-                              } else if (currentView == 'equalizer') {
-                                setState(
-                                  () => selectedEqPreset = max(
-                                    0,
-                                    selectedEqPreset - 1,
-                                  ),
-                                );
-                                _saveData();
-                              } else if (currentView == 'settings') {
-                                setState(
-                                  () => selectedMenuItem = max(
-                                    0,
-                                    selectedMenuItem - 1,
-                                  ),
-                                );
-                                _scrollToItem(
-                                  _settingsScrollController,
-                                  selectedMenuItem,
-                                );
-                              } else if (currentView == 'game_menu') {
-                                setState(
-                                  () => selectedGameItem = max(
-                                    0,
-                                    selectedGameItem - 1,
-                                  ),
-                                );
-                                _scrollToItem(
-                                  _gameMenuScrollController,
-                                  selectedGameItem,
-                                );
-                              } else if (currentView == 'snake') {
-                                if (snakeDir != const Point(0, 1))
-                                  snakeDir = const Point(0, -1);
-                              } else if (currentView == 'tetris')
-                                _rotateTetris();
-                              else if (currentView == '2048')
-                                _move2048(0, -1);
-                              else if (currentView == 'flappy')
-                                birdVelocity = -1.8;
-                              else if (currentView == 'frogger')
-                                _moveFrogger(0, -1);
-                              else if (currentView == 'player')
-                                _handleVolumeChange(10.0);
-                            },
-                            onDown: () {
-                              if (currentView == 'library') {
-                                setState(
-                                  () => selectedLibraryItem = min(
-                                    filteredLibraryPaths.length - 1,
-                                    selectedLibraryItem + 1,
-                                  ),
-                                );
-                                _scrollToItem(
-                                  _libraryScrollController,
-                                  selectedLibraryItem,
-                                );
-                              } else if (currentView == 'menu') {
-                                setState(
-                                  () => selectedMenuItem = min(
-                                    menuItems.length - 1,
-                                    selectedMenuItem + 1,
-                                  ),
-                                );
-                                _scrollToItem(
-                                  _menuScrollController,
-                                  selectedMenuItem,
-                                );
-                              } else if (currentView == 'equalizer') {
-                                setState(
-                                  () => selectedEqPreset = min(
-                                    eqPresets.length - 1,
-                                    selectedEqPreset + 1,
-                                  ),
-                                );
-                                _saveData();
-                              } else if (currentView == 'game_menu') {
-                                setState(
-                                  () => selectedGameItem = min(
-                                    gameList.length - 1,
-                                    selectedGameItem + 1,
-                                  ),
-                                );
-                                _scrollToItem(
-                                  _gameMenuScrollController,
-                                  selectedGameItem,
-                                );
-                              } else if (currentView == 'settings') {
-                                setState(
-                                  () => selectedMenuItem = min(
-                                    4,
-                                    selectedMenuItem + 1,
-                                  ),
-                                );
-                                _scrollToItem(
-                                  _settingsScrollController,
-                                  selectedMenuItem,
-                                );
-                              } else if (currentView == 'snake') {
-                                if (snakeDir != const Point(0, -1))
-                                  snakeDir = const Point(0, 1);
-                              } else if (currentView == 'tetris')
-                                _updateTetris();
-                              else if (currentView == '2048')
-                                _move2048(0, 1);
-                              else if (currentView == 'frogger')
-                                _moveFrogger(0, 1);
-                              else if (currentView == 'player')
-                                _handleVolumeChange(-10.0);
-                            },
-                            onLeft: () {
-                              if (currentView == 'snake') {
-                                if (snakeDir != const Point(1, 0))
-                                  snakeDir = const Point(-1, 0);
-                              } else if (currentView == 'tetris')
-                                _moveTetris(-1);
-                              else if (currentView == '2048')
-                                _move2048(-1, 0);
-                              else if (currentView == 'racing')
-                                setState(
-                                  () => playerLane = max(0, playerLane - 1),
-                                );
-                              else if (currentView == 'frogger')
-                                _moveFrogger(-1, 0);
-                              else
-                                player.previous();
-                            },
-                            onRight: () {
-                              if (currentView == 'snake') {
-                                if (snakeDir != const Point(-1, 0))
-                                  snakeDir = const Point(1, 0);
-                              } else if (currentView == 'tetris')
-                                _moveTetris(1);
-                              else if (currentView == '2048')
-                                _move2048(1, 0);
-                              else if (currentView == 'racing')
-                                setState(
-                                  () => playerLane = min(2, playerLane + 1),
-                                );
-                              else if (currentView == 'frogger')
-                                _moveFrogger(1, 0);
-                              else
-                                player.next();
-                            },
+                            onUp: _handleUp,
+                            onDown: _handleDown,
+                            onLeft: _handleLeft,
+                            onRight: _handleRight,
                           ),
                           Row(
                             children: [
@@ -1509,54 +1734,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                                     width: 55,
                                     height: 55,
                                     isCircle: true,
-                                    onTap: () {
-                                      if (currentView == 'snake') {
-                                        if (isSnakeGameOver || !isPlayingSnake)
-                                          _startSnakeGame();
-                                        else
-                                          setState(
-                                            () => isPlayingSnake =
-                                                !isPlayingSnake,
-                                          );
-                                      } else if (currentView == 'tetris') {
-                                        if (isTetrisGameOver ||
-                                            !isPlayingTetris)
-                                          _startTetrisGame();
-                                        else
-                                          setState(
-                                            () => isPlayingTetris =
-                                                !isPlayingTetris,
-                                          );
-                                      } else if (currentView == '2048') {
-                                        if (isGameOver2048 || score2048 == 0)
-                                          _start2048();
-                                      } else if (currentView == 'racing') {
-                                        if (isRacingGameOver ||
-                                            !isPlayingRacing)
-                                          _startRacing();
-                                        else
-                                          setState(
-                                            () => isPlayingRacing = false,
-                                          );
-                                      } else if (currentView == 'flappy') {
-                                        if (isFlappyGameOver ||
-                                            !isPlayingFlappy)
-                                          _startFlappy();
-                                        else
-                                          setState(
-                                            () => isPlayingFlappy = false,
-                                          );
-                                      } else if (currentView == 'frogger') {
-                                        if (isFroggerGameOver ||
-                                            !isPlayingFrogger)
-                                          _startFrogger();
-                                        else
-                                          setState(
-                                            () => isPlayingFrogger = false,
-                                          );
-                                      } else
-                                        player.playOrPause();
-                                    },
+                                    onTap: _handlePlay,
                                     child: const Center(
                                       child: Icon(
                                         Icons.play_arrow,
@@ -1662,11 +1840,14 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                                   ),
                                 ),
                               ),
-                              const Padding(
-                                padding: EdgeInsets.only(right: 15, top: 4),
+                              Padding(
+                                padding: const EdgeInsets.only(
+                                  right: 15,
+                                  top: 4,
+                                ),
                                 child: Text(
-                                  'VOLTAR',
-                                  style: TextStyle(
+                                  t('back'),
+                                  style: const TextStyle(
                                     color: Colors.white70,
                                     fontSize: 10,
                                     fontWeight: FontWeight.bold,
@@ -1726,8 +1907,9 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     Widget gameChild,
     bool isGameOver,
     bool isPlaying,
-    double aspectRatio,
-  ) {
+    double aspectRatio, {
+    bool isPaused = false,
+  }) {
     return SizedBox.expand(
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
@@ -1813,9 +1995,9 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                                 child: Container(
                                   padding: const EdgeInsets.all(12),
                                   color: Colors.black87,
-                                  child: const Text(
-                                    'PRESS PLAY',
-                                    style: TextStyle(
+                                  child: Text(
+                                    isPaused ? t('paused') : 'PRESS PLAY',
+                                    style: const TextStyle(
                                       color: Colors.white,
                                       fontFamily: 'RetroFont',
                                       fontWeight: FontWeight.bold,
@@ -1869,6 +2051,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       isSnakeGameOver,
       isPlayingSnake,
       1.0,
+      isPaused: _isRunning(snakeTimer),
     );
   }
 
@@ -1906,6 +2089,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       isTetrisGameOver,
       isPlayingTetris,
       tetrisCols / tetrisRows,
+      isPaused: _isRunning(tetrisTimer),
     );
   }
 
@@ -1930,7 +2114,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
           return Container(
             margin: const EdgeInsets.all(2),
             decoration: BoxDecoration(
-              color: Colors.black.withOpacity(opacity),
+              color: Colors.black.withValues(alpha: opacity),
               borderRadius: BorderRadius.circular(4),
             ),
             child: Center(
@@ -2010,6 +2194,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       isRacingGameOver,
       isPlayingRacing,
       0.7,
+      isPaused: _isRunning(racingTimer),
     );
   }
 
@@ -2070,6 +2255,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       isFlappyGameOver,
       isPlayingFlappy,
       1.0,
+      isPaused: _isRunning(flappyTimer),
     );
   }
 
@@ -2130,6 +2316,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
       isFroggerGameOver,
       isPlayingFrogger,
       1.0,
+      isPaused: _isRunning(froggerTimer),
     );
   }
 
@@ -2142,7 +2329,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16.0),
               child: TextScroll(
-                currentTrackName,
+                _displayTrackName,
                 mode: TextScrollMode.bouncing,
                 velocity: const Velocity(pixelsPerSecond: Offset(30, 0)),
                 pauseBetween: const Duration(seconds: 2),
@@ -2157,72 +2344,21 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
               ),
             ),
             const SizedBox(height: 30),
-            visualStyle == 'spectrum'
-                ? CustomPaint(
-                    size: const Size(120, 60),
-                    painter: SpectrumPainter(bars: spectrumBars),
-                  )
-                : CustomPaint(
-                    size: const Size(180, 60),
-                    painter: WaveformPainter(
-                      phase: wavePhase,
-                      amplitude: currentWaveAmplitude,
-                      complexity: currentWaveComplexity,
-                      color: Colors.black87,
-                    ),
-                  ),
+            RepaintBoundary(
+              child: RetroVisualizer(
+                player: player,
+                style: visualStyle,
+                trackName: currentTrackName,
+              ),
+            ),
             const SizedBox(height: 35),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
-              child: Row(
-                children: [
-                  Text(
-                    formatDuration(position),
-                    style: const TextStyle(
-                      color: Colors.black,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 13,
-                      fontFamily: 'RetroFont',
-                    ),
-                  ),
-                  Expanded(
-                    child: SliderTheme(
-                      data: SliderTheme.of(context).copyWith(
-                        thumbShape: const RoundSliderThumbShape(
-                          enabledThumbRadius: 6,
-                        ),
-                        overlayShape: SliderComponentShape.noOverlay,
-                        trackHeight: 6,
-                        activeTrackColor: Colors.black,
-                        inactiveTrackColor: Colors.black26,
-                        thumbColor: Colors.black,
-                      ),
-                      child: Slider(
-                        min: 0.0,
-                        max: duration.inMilliseconds > 0
-                            ? duration.inMilliseconds.toDouble()
-                            : 1.0,
-                        value: position.inMilliseconds.toDouble().clamp(
-                          0.0,
-                          duration.inMilliseconds > 0
-                              ? duration.inMilliseconds.toDouble()
-                              : 1.0,
-                        ),
-                        onChanged: (v) =>
-                            player.seek(Duration(milliseconds: v.toInt())),
-                      ),
-                    ),
-                  ),
-                  Text(
-                    formatDuration(duration),
-                    style: const TextStyle(
-                      color: Colors.black,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 13,
-                      fontFamily: 'RetroFont',
-                    ),
-                  ),
-                ],
+              child: StreamBuilder<Duration>(
+                stream: player.stream.position,
+                initialData: player.state.position,
+                builder: (context, snapshot) =>
+                    _buildProgressRow(snapshot.data ?? Duration.zero),
               ),
             ),
           ],
@@ -2238,7 +2374,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                 borderRadius: BorderRadius.circular(8),
               ),
               child: Text(
-                "${lang[currentLang]!['vol']}: ${currentVolume.toInt()}%",
+                "${t('vol')}: ${currentVolume.toInt()}%",
                 style: const TextStyle(
                   color: Colors.white,
                   fontFamily: 'RetroFont',
@@ -2247,6 +2383,44 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
               ),
             ),
           ),
+      ],
+    );
+  }
+
+  Widget _buildProgressRow(Duration position) {
+    final maxMs = duration.inMilliseconds > 0
+        ? duration.inMilliseconds.toDouble()
+        : 1.0;
+    const timeStyle = TextStyle(
+      color: Colors.black,
+      fontWeight: FontWeight.bold,
+      fontSize: 13,
+      fontFamily: 'RetroFont',
+    );
+    return Row(
+      children: [
+        Text(formatDuration(position), style: timeStyle),
+        Expanded(
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+              overlayShape: SliderComponentShape.noOverlay,
+              trackHeight: 6,
+              activeTrackColor: Colors.black,
+              inactiveTrackColor: Colors.black26,
+              thumbColor: Colors.black,
+            ),
+            child: Slider(
+              min: 0.0,
+              max: maxMs,
+              value: position.inMilliseconds.toDouble().clamp(0.0, maxMs),
+              onChanged: queuePaths.isEmpty
+                  ? null
+                  : (v) => player.seek(Duration(milliseconds: v.toInt())),
+            ),
+          ),
+        ),
+        Text(formatDuration(duration), style: timeStyle),
       ],
     );
   }
@@ -2329,7 +2503,6 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     final description = isPortuguese
         ? preset['descriptionPt']
         : preset['descriptionEn'];
-    final bands = (preset['bands'] as List).cast<double>();
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -2350,6 +2523,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
           const Divider(color: Colors.black, thickness: 2, height: 25),
           Expanded(
             child: ListView.builder(
+              controller: _eqScrollController,
               itemCount: eqPresets.length,
               itemBuilder: (context, index) {
                 final item = eqPresets[index];
@@ -2358,11 +2532,9 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                 final itemDescription = isPortuguese
                     ? item['descriptionPt']
                     : item['descriptionEn'];
+                final bands = _presetBands(index);
                 return GestureDetector(
-                  onTap: () {
-                    setState(() => selectedEqPreset = index);
-                    _saveData();
-                  },
+                  onTap: () => _selectEqPreset(index),
                   child: Container(
                     height: 58,
                     margin: const EdgeInsets.symmetric(vertical: 5),
@@ -2422,7 +2594,12 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                                 .map(
                                   (value) => Container(
                                     width: 8,
-                                    height: 8 + value * 22,
+                                    // Mostra o efeito já com a força atual.
+                                    height:
+                                        8 +
+                                        (0.5 + (value - 0.5) * eqStrength)
+                                                .clamp(0.0, 1.0) *
+                                            22,
                                     color: Colors.black,
                                   ),
                                 )
@@ -2436,6 +2613,8 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
               },
             ),
           ),
+          const SizedBox(height: 6),
+          _buildEqStrengthControl(),
           const SizedBox(height: 4),
           Center(
             child: Text(
@@ -2452,16 +2631,86 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
     );
   }
 
+  /// Controlo da força do efeito: [-] blocos [+] e percentagem. Também
+  /// responde às setas esquerda/direita do D-pad.
+  Widget _buildEqStrengthControl() {
+    const textStyle = TextStyle(
+      color: Colors.black,
+      fontWeight: FontWeight.bold,
+      fontSize: 13,
+      fontFamily: 'RetroFont',
+    );
+    final steps = (equalizerMaxStrength / equalizerStrengthStep).round();
+    final filled = (eqStrength / equalizerStrengthStep).round();
+    final neutral = (1.0 / equalizerStrengthStep).round();
+
+    Widget stepButton(IconData icon, double delta, String key) =>
+        GestureDetector(
+          key: ValueKey(key),
+          onTap: () => _changeEqStrength(delta),
+          child: Container(
+            width: 26,
+            height: 22,
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.black, width: 2),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Icon(icon, size: 16, color: Colors.black),
+          ),
+        );
+
+    return Row(
+      children: [
+        Text(t('eq_strength'), style: textStyle),
+        const SizedBox(width: 8),
+        stepButton(Icons.remove, -equalizerStrengthStep, 'eq_strength_minus'),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Row(
+            children: [
+              for (int i = 1; i <= steps; i++)
+                Expanded(
+                  child: Container(
+                    height: 14,
+                    margin: EdgeInsets.only(
+                      right: 2,
+                      // Separador visual nos 100%.
+                      left: i == neutral + 1 ? 3 : 0,
+                    ),
+                    decoration: BoxDecoration(
+                      color: i <= filled ? Colors.black : Colors.black12,
+                      border: Border.all(color: Colors.black54, width: 1),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 4),
+        stepButton(Icons.add, equalizerStrengthStep, 'eq_strength_plus'),
+        const SizedBox(width: 6),
+        SizedBox(
+          width: 40,
+          child: Text(
+            '${(eqStrength * 100).round()}%',
+            textAlign: TextAlign.right,
+            style: textStyle,
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildGameMenuView() {
     return Container(
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Center(
+          Center(
             child: Text(
-              'ESCOLHE O JOGO',
-              style: TextStyle(
+              t('choose_game'),
+              style: const TextStyle(
                 color: Colors.black,
                 fontWeight: FontWeight.w900,
                 fontSize: 18,
@@ -2524,7 +2773,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
   }
 
   Widget _buildLibraryView() {
-    if (libraryPaths.isEmpty)
+    if (libraryPaths.isEmpty) {
       return Center(
         child: Text(
           lang[currentLang]!['lib_empty']!,
@@ -2535,8 +2784,10 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
           ),
         ),
       );
+    }
 
     final currentList = filteredLibraryPaths;
+    final playingPath = _currentQueuePath;
 
     return Container(
       padding: const EdgeInsets.only(top: 16, bottom: 16, left: 16, right: 8),
@@ -2581,7 +2832,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                     horizontal: 10,
                     vertical: 0,
                   ),
-                  hintText: 'PESQUISAR...',
+                  hintText: t('search_hint'),
                   hintStyle: const TextStyle(
                     color: Colors.black54,
                     fontFamily: 'RetroFont',
@@ -2627,33 +2878,9 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                       itemBuilder: (context, index) {
                         final isSelected = index == selectedLibraryItem;
                         final isPlayingTrack =
-                            queuePaths.isNotEmpty &&
-                            queuePaths[currentIndex] == currentList[index];
+                            currentList[index] == playingPath;
                         return GestureDetector(
-                          onTap: () {
-                            setState(() {
-                              selectedLibraryItem = index;
-                              final tappedItem = currentList[index];
-                              queuePaths = List.from(libraryPaths);
-                              if (isShuffle) {
-                                List<String> remaining = List.from(libraryPaths)
-                                  ..remove(tappedItem);
-                                remaining.shuffle();
-                                queuePaths = [tappedItem, ...remaining];
-                                currentIndex = 0;
-                              } else {
-                                currentIndex = libraryPaths.indexOf(tappedItem);
-                              }
-                              _playPlaylist(
-                                startIndex: currentIndex,
-                                autoPlay: true,
-                              );
-                              currentView = 'player';
-                              _searchController.clear();
-                              _searchQuery = '';
-                              _showSearchBar = true;
-                            });
-                          },
+                          onTap: () => _playFromLibrary(currentList[index]),
                           child: Container(
                             height: 50,
                             margin: const EdgeInsets.symmetric(
@@ -2728,10 +2955,11 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
                                 .toUpperCase();
                             selectedLibraryItem = targetIndex;
                           });
-                          if (maxExt > 0)
+                          if (maxExt > 0) {
                             _libraryScrollController.jumpTo(
                               percentage * maxExt,
                             );
+                          }
                         },
                         onVerticalDragEnd: (_) =>
                             setState(() => isDraggingLetter = false),
@@ -2820,7 +3048,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
             Expanded(
               child: ReorderableListView.builder(
                 scrollController: _queueScrollController,
-                itemCount: queuePaths.length - currentIndex,
+                itemCount: max(0, queuePaths.length - currentIndex),
                 onReorderItem: _reorderQueue,
                 itemBuilder: (context, i) {
                   final realIndex = currentIndex + i;
@@ -2930,52 +3158,7 @@ class _RetroDeviceScreenState extends State<RetroDeviceScreen>
   Widget _buildSettingItem(int index, IconData icon, String title) {
     final isSelected = index == selectedMenuItem;
     return GestureDetector(
-      onTap: () {
-        setState(() => selectedMenuItem = index);
-        if (index == 0) {
-          setState(() => currentLang = currentLang == 'pt' ? 'en' : 'pt');
-          _saveData();
-        } else if (index == 1) {
-          setState(
-            () => currentThemeIndex =
-                (currentThemeIndex + 1) % retroThemes.length,
-          );
-          _saveData();
-        } else if (index == 2) {
-          setState(
-            () =>
-                visualStyle = visualStyle == 'spectrum' ? 'waves' : 'spectrum',
-          );
-          _saveData();
-        } else if (index == 3) {
-          setState(() {
-            _focusModeDuration = _focusModeDuration == 0
-                ? 15
-                : _focusModeDuration == 15
-                ? 30
-                : _focusModeDuration == 30
-                ? 60
-                : 0;
-            if (_focusModeDuration > 0) {
-              _focusModeEndTime = DateTime.now().add(
-                Duration(minutes: _focusModeDuration),
-              );
-            } else {
-              _focusModeEndTime = null;
-            }
-          });
-        } else if (index == 4) {
-          setState(() {
-            libraryPaths.clear();
-            queuePaths.clear();
-            currentView = 'player';
-          });
-          _saveData();
-        } else if (index == 5) {
-          final Uri url = Uri.parse('https://github.com/alexis6859/bitplayer');
-          launchUrl(url, mode: LaunchMode.externalApplication);
-        }
-      },
+      onTap: () => _activateSetting(index),
       child: Container(
         height: 54,
         margin: const EdgeInsets.symmetric(vertical: 6),

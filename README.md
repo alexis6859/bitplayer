@@ -16,10 +16,39 @@ This application was developed by **Alexandre Silva** as a personal project over
 
 As this was a summer learning project, there are a few rough edges. The currently known issues are:
 
-* Clicking the "Mix" (shuffle) button causes the currently playing track to restart.
 * In the mini-games, the playable screen area should ideally start slightly higher up on the display.
-* In Tetris, the game fails to clear the board correctly if more than two full lines are completed at the exact same time.
-* The DSP Equalizer and the audio visualizer spectrum bars are experimental and not 100% functional or accurate yet.
+
+Fixed:
+
+* ~~Clicking the "Mix" (shuffle) button causes the currently playing track to restart.~~ The queue is now reordered in place, so playback continues.
+* ~~In Tetris, the game fails to clear the board correctly if more than two full lines are completed at the exact same time.~~
+* ~~The DSP Equalizer is experimental.~~ Presets are now applied as real audio filters (mpv `af`), with an adjustable strength (0–200%).
+* ~~The audio visualizer is not accurate.~~ It now follows the real audio: mpv measures 12 frequency bands (40 Hz–16 kHz), one per spectrum bar; the wave follows loudness and timbre. Measuring only runs while the player screen is visible.
+
+## Keyboard shortcuts (desktop)
+
+| Key | Action |
+| --- | --- |
+| Arrow keys | D-Pad (on the Equalizer screen, ◀ ▶ change the effect strength) |
+| Enter | OK |
+| Space | PLAY (start / pause games) |
+| Esc / Backspace | BACK |
+| M | MENU |
+| S | MIX (shuffle) |
+
+## Running on Linux
+
+```bash
+sudo apt install libgtk-3-dev libmpv-dev
+flutter run -d linux
+```
+
+## Tests
+
+```bash
+flutter test                               # unit tests (game logic, playlist, equalizer)
+flutter test integration_test -d linux     # end-to-end test driving the real app
+```
 
 ## Feedback & Improvements
 
